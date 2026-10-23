@@ -1,51 +1,43 @@
 
-import json
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
+import os
+from dotenv import load_dotenv
+from openai import OpenAI, APIConnectionError, APIStatusError, APITimeoutError
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL = "llama3.2"
+load_dotenv()
+
+api_key = os.getenv("OPENAI_API_KEY")
+
+if not api_key:
+    raise RuntimeError(
+        "OPENAI_API_KEY is missing. Check your .env file."
+    )
+
+client = OpenAI(api_key=api_key, timeout=60.0, max_retries=2)
 
 
 def test_chat():
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": "Explain what an AI chatbot is in two sentences."
-            }
-        ],
-        "stream": False
-    }
-
-    request_data = json.dumps(payload).encode("utf-8")
-
-    request = Request(
-        OLLAMA_URL,
-        data=request_data,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-
     try:
-        with urlopen(request, timeout=120) as response:
-            result = json.loads(response.read().decode("utf-8"))
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            instructions=(
+                "You are a helpful AI assistant. "
+                "Explain technical topics clearly and simply."
+            ),
+            input="Explain what an AI chatbot is in two sentences."
+        )
 
-        print("\nAI Response:")
-        print(result["message"]["content"])
+        print("\nOpenAI Response:")
+        print(response.output_text)
 
-    except HTTPError as error:
-        print(f"Ollama returned HTTP error {error.code}: {error.reason}")
+    except APITimeoutError:
+        print("The OpenAI request timed out. Please try again.")
 
-    except URLError as error:
-        print(f"Could not connect to Ollama: {error.reason}")
+    except APIConnectionError:
+        print("Could not connect to OpenAI. Check your internet connection.")
 
-    except TimeoutError:
-        print("The request timed out. Try again or use a smaller model.")
-
-    except (KeyError, json.JSONDecodeError):
-        print("Ollama returned an unexpected response format.")
+    except APIStatusError as error:
+        print(f"OpenAI API error: HTTP {error.status_code}")
+        print(error.message)
 
 
 if __name__ == "__main__":
