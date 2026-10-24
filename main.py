@@ -1,51 +1,44 @@
 
 import os
+import logging
 from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from openai import (
-    OpenAI,
-    APIConnectionError,
-    APIStatusError,
-    APITimeoutError,
-    RateLimitError,
-)
+from google import genai
+from google.genai import errors, types
 from pydantic import BaseModel, Field
 
 load_dotenv()
 
-api_key = os.getenv("OPENAI_API_KEY")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+api_key = os.getenv("GEMINI_API_KEY")
 
 if not api_key:
-    raise RuntimeError(
-        "OPENAI_API_KEY is missing. Check your .env file."
-    )
+    raise RuntimeError("GEMINI_API_KEY is missing. Check your .env file.")
 
-client = OpenAI(
-    api_key=api_key,
-    timeout=60.0,
-    max_retries=2,
-)
+client = genai.Client(api_key=api_key)
 
-app = FastAPI(
-    title="Context-Aware AI Chatbot",
-    description="A multi-turn chatbot powered by OpenAI.",
-    version="2.0.0",
-)
-
-MODEL = "gpt-4.1-mini"
+MODEL = "gemini-3.8-flash"
 
 SYSTEM_PROMPT = (
     "You are a friendly, context-aware AI assistant. "
     "Give clear, accurate, beginner-friendly answers. "
-    "Remember details from earlier messages in the same conversation. "
+    "Use earlier messages in the same conversation when relevant. "
     "If you are unsure about something, say so rather than inventing facts."
 )
 
-conversation_histories = {}
-
 MAX_HISTORY_MESSAGES = 10
+
+app = FastAPI(
+    title="Context-Aware AI Chatbot",
+    description="A multi-turn chatbot powered by Google Gemini.",
+    version="3.1.0",
+)
+
+conversation_histories: dict[str, list[dict[str, str]]] = {}
 
 
 class ChatRequest(BaseModel):
@@ -58,6 +51,22 @@ class ChatResponse(BaseModel):
     conversation_id: str
 
 
+@app.get("/")
+def home():
+    return {
+        "message": "Context-Aware AI Chatbot API is running.",
+        "provider": "Google Gemini",
+        "model": MODEL,
+        "chat_endpoint": "/chat",
+        "docs": "/docs",
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
     conversation_id = request.conversation_id or str(uuid4())
@@ -66,24 +75,40 @@ def chat(request: ChatRequest):
         conversation_histories[conversation_id] = []
 
     history = conversation_histories[conversation_id]
+    history_limit = MAX_HISTORY_MESSAGES - (MAX_HISTORY_MESSAGES % 2)
+    recent_history = history[-history_limit:]
 
-    messages = history[-MAX_HISTORY_MESSAGES:] + [
-        {"role": "user", "content": request.message}
-    ]
+    gemini_history = []
 
-    try:
-        response = client.responses.create(
-            model=MODEL,
-            instructions=SYSTEM_PROMPT,
-            input=messages,
+    for message in recent_history:
+        role = "user" if message["role"] == "user" else "model"
+
+        gemini_history.append(
+            types.Content(
+                role=role,
+                parts=[types.Part(text=message["content"])],
+            )
         )
 
-        reply = response.output_text
+    try:
+        chat_session = client.chats.create(
+            model=MODEL,
+            history=gemini_history,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                automatic_function_calling=(
+                    types.AutomaticFunctionCallingConfig(disable=True)
+                ),
+            ),
+        )
+
+        response = chat_session.send_message(message=request.message)
+        reply = response.text
 
         if not reply or not reply.strip():
             raise HTTPException(
                 status_code=502,
-                detail="The AI model returned an empty response.",
+                detail="Gemini returned an empty response.",
             )
 
         history.extend([
@@ -91,41 +116,49 @@ def chat(request: ChatRequest):
             {"role": "assistant", "content": reply},
         ])
 
-        conversation_histories[conversation_id] = (
-            history[-MAX_HISTORY_MESSAGES:]
-        )
+        conversation_histories[conversation_id] = history[-history_limit:]
+
+        logger.info("Chat response generated successfully.")
 
         return ChatResponse(
             reply=reply,
             conversation_id=conversation_id,
         )
 
-    except RateLimitError as error:
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                "OpenAI rate limit or quota reached. "
-                "Check your API billing, credits, and usage limits."
-            ),
-        ) from error
-
-    except APITimeoutError as error:
-        raise HTTPException(
-            status_code=504,
-            detail="The OpenAI request timed out. Please try again.",
-        ) from error
-
-    except APIConnectionError as error:
-        raise HTTPException(
-            status_code=503,
-            detail="Could not connect to OpenAI. Check your connection.",
-        ) from error
-
-    except APIStatusError as error:
-        raise HTTPException(
-            status_code=502,
-            detail=f"OpenAI returned an API error (HTTP {error.status_code}).",
-        ) from error
-
     except HTTPException:
         raise
+
+    except errors.APIError as error:
+        status_code = getattr(error, "code", 502)
+        logger.error("Gemini API error: HTTP %s - %s", status_code, error)
+
+        if status_code == 429:
+            raise HTTPException(
+                status_code=429,
+                detail="Gemini quota or rate limit reached. Check your API usage.",
+            ) from error
+
+        if status_code in (401, 403):
+            raise HTTPException(
+                status_code=502,
+                detail="Gemini authentication or access error. Check your API key.",
+            ) from error
+
+        if status_code == 408:
+            raise HTTPException(
+                status_code=504,
+                detail="Gemini request timed out. Please retry.",
+            ) from error
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini API request failed (HTTP {status_code}).",
+        ) from error
+
+    except Exception as error:
+        logger.exception("Unexpected error while processing chat request.")
+
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected server error occurred. Check the backend terminal.",
+        ) from error
